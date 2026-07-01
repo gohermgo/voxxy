@@ -1,0 +1,28 @@
+[workspace]
+members = []
+package = {
+  edition = "2024",
+  version = "0.1.0",
+  authors = ["joanna"]
+}
+
+[package]
+name = "voxxy"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+
+[dependencies]
+anyhow = "1.0.103"
+cpal = "0.18.1"
+crossbeam = "0.8.4"
+eframe = "0.35.0"
+egui = "0.35.0"
+egui_plot = "0.36.0"
+heapless = "0.9.3"
+hound = "3.5.1"
+nalgebra = "0.35.0"
+rubato = "3.0.0"
+rustfft = "6.4.1"
+tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_level_debug"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "tracing"] }
