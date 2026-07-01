@@ -342,7 +342,6 @@ fn is_voiced(in_buf: &[f32], threshold: f32) -> bool {
 struct LpcFramer {
     /// we store samples as they arrive from the [audio thread](audio_thread::AudioThread)
     accumulator: Vec<f32>,
-    #[expect(dead_code)]
     window_size: usize,
     // < window_size for overlapping frames, smoother formant tracking
     hop_size: usize,
