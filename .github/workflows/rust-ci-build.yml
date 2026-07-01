@@ -12,10 +12,6 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-
     steps:
       - name: checkout code
         uses: actions/checkout@v4
@@ -28,9 +24,6 @@ jobs:
 
       - name: install rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.4
 
       - name: cache cargo
         uses: Swatinem/rust-cache@v2
