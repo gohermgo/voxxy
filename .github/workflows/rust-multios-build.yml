@@ -5,7 +5,6 @@ name: rust-multios-build
 # if u build ON the os, surely it runs on it too
 
 on:
-  push:
   pull_request:
 
 jobs:
