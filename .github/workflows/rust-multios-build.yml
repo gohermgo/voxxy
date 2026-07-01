@@ -1,0 +1,70 @@
+name: rust-multios-build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+          - os: ubuntu-latest
+            name: arch
+            container: archlinux:latest
+          - os: ubuntu-latest
+            name: nix
+
+    runs-on: ${{ matrix.os }}
+
+    container: ${{ matrix.container || '' }}
+
+    steps:
+      - name: checkout (the ritual gateway)
+        uses: actions/checkout@v4
+
+      # ─────────────── NIX PATH (pure snow-globe build system) ───────────────
+      - name: install nix
+        if: matrix.name == 'nix'
+        uses: cachix/install-nix-action@v27
+
+      - name: nix build
+        if: matrix.name == 'nix'
+        run: |
+          nix develop --command cargo build --release
+
+      # ─────────────── ARCH PATH (arch btw) ───────────────
+      - name: install rust
+        if: matrix.name == 'arch'
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm rust cargo
+
+      - name: arch build
+        if: matrix.name == 'arch'
+        run: cargo build --release
+
+      # ─────────────── NORMAL PATHS ───────────────
+      - name: install rust (windows/linux)
+        if: matrix.name != 'nix' && matrix.name != 'arch'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo
+        if: matrix.name != 'nix'
+        uses: Swatinem/rust-cache@v2
+
+      - name: build (windows/linux)
+        if: matrix.name != 'nix' && matrix.name != 'arch'
+        run: cargo build --release
+
+      # ─────────────── ARTIFACT EXPORT ───────────────
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxxy-${{ matrix.name }}
+          path: |
+            target/release/*
