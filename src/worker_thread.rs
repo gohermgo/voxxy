@@ -40,7 +40,7 @@ impl WorkerThread {
     ) -> anyhow::Result<WorkerThread> {
         let default_resampler_parameters = SincInterpolationParameters {
             sinc_len: 128,
-            f_cutoff: 0.88,
+            f_cutoff: 0.95,
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
