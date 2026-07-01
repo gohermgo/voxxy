@@ -1,0 +1,33 @@
+name: rust-ci-build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: build release
+        run: cargo build --release
+
+      - name: upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxxy-${{ matrix.os }}
+          path: |
+            target/release/*
