@@ -83,6 +83,75 @@ fn main() -> anyhow::Result<()> {
 
 use egui_plot::{Plot, PlotPoints, Points};
 
+// typical formant ranges in Hz, used ONLY as a cold-start / post-silence seed —
+// once continuity tracking has a confirmed anchor these bounds get ignored.
+// leanin toward femme-typical ranges since that's the target use case, widen
+// if u want this generic later
+const FORMANT_SEED_RANGES: [(f32, f32); 4] = [
+    (250.0, 950.0),   // F1
+    (950.0, 2500.0),  // F2
+    (2500.0, 3500.0), // F3
+    (3500.0, 4500.0), // F4
+];
+
+/// re-maps a raw sorted-ascending, zero-padded formant array (as sent by the
+/// lpc thread) onto stable F1..F4 slots. if `last_confirmed` has an established
+/// value for a slot, we greedily match the closest raw candidate to it (continuity).
+/// any candidate that isn't claimed by continuity matching (typically only relevant
+/// right after silence, when last_confirmed is all zero) gets seeded via static
+/// range membership instead.
+fn assign_formants(raw: &[f32; 4], last_confirmed: &[f32; 4]) -> [f32; 4] {
+    let candidates: Vec<f32> = raw.iter().copied().filter(|&v| v > 0.0).collect();
+    let mut assigned = [0.0f32; 4];
+    let mut claimed = [false; 4]; // candidates already placed, by index into `candidates`
+
+    // --- pass 1: continuity, greedy nearest-neighbor ---
+    // build (slot, candidate_idx, distance) for every established slot × unclaimed candidate,
+    // sort by distance ascending, claim greedily. small N (<=4x4), brute force is plenty.
+    let mut pairs: Vec<(usize, usize, f32)> = Vec::new();
+    for (slot, &conf) in last_confirmed.iter().enumerate() {
+        if conf <= 0.0 {
+            continue; // no established anchor for this slot yet
+        }
+        for (ci, &cand) in candidates.iter().enumerate() {
+            pairs.push((slot, ci, (cand - conf).abs()));
+        }
+    }
+    pairs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+
+    let mut slot_taken = [false; 4];
+    for (slot, ci, dist) in pairs {
+        if slot_taken[slot] || claimed[ci] {
+            continue;
+        }
+        // sanity ceiling — a jump this big ain't continuity, it's a different formant
+        // entirely, let pass 2 handle it via static seeding instead
+        const MAX_CONTINUITY_JUMP_HZ: f32 = 400.0;
+        if dist > MAX_CONTINUITY_JUMP_HZ {
+            continue;
+        }
+        assigned[slot] = candidates[ci];
+        slot_taken[slot] = true;
+        claimed[ci] = true;
+    }
+
+    // --- pass 2: static-range seeding for anything continuity didn't claim ---
+    for (ci, &cand) in candidates.iter().enumerate() {
+        if claimed[ci] {
+            continue;
+        }
+        for (slot, &(lo, hi)) in FORMANT_SEED_RANGES.iter().enumerate() {
+            if !slot_taken[slot] && cand >= lo && cand < hi {
+                assigned[slot] = cand;
+                slot_taken[slot] = true;
+                claimed[ci] = true;
+                break;
+            }
+        }
+    }
+
+    assigned
+}
 struct FormantApp {
     formant_rx: crossbeam::channel::Receiver<[f32; 4]>,
     history: std::collections::VecDeque<[f32; 4]>,
@@ -96,6 +165,8 @@ struct FormantApp {
 impl eframe::App for FormantApp {
     fn logic(&mut self, _: &egui::Context, _: &mut eframe::Frame) {
         while let Ok(f) = self.formant_rx.try_recv() {
+            let f = assign_formants(&f, &self.last_valid);
+
             // only update if at least F1 is real, otherwise keep last known
             if f[0] > 0.0 {
                 self.is_voiced = true;
