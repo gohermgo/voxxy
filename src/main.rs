@@ -85,8 +85,7 @@ use egui_plot::{Plot, PlotPoints, Points};
 
 // typical formant ranges in Hz, used ONLY as a cold-start / post-silence seed —
 // once continuity tracking has a confirmed anchor these bounds get ignored.
-// leanin toward femme-typical ranges since that's the target use case, widen
-// if u want this generic later
+// leanin toward femme-typical ranges since that's the target use case
 const FORMANT_SEED_RANGES: [(f32, f32); 4] = [
     (250.0, 950.0),   // F1
     (950.0, 2500.0),  // F2
@@ -106,7 +105,7 @@ fn assign_formants(raw: &[f32; 4], last_confirmed: &[f32; 4]) -> [f32; 4] {
     let mut claimed = [false; 4]; // candidates already placed, by index into `candidates`
 
     // --- pass 1: continuity, greedy nearest-neighbor ---
-    // build (slot, candidate_idx, distance) for every established slot × unclaimed candidate,
+    // build (slot, candidate_idx, distance) for every established slot x unclaimed candidate,
     // sort by distance ascending, claim greedily. small N (<=4x4), brute force is plenty.
     let mut pairs: Vec<(usize, usize, f32)> = Vec::new();
     for (slot, &conf) in last_confirmed.iter().enumerate() {
@@ -124,7 +123,7 @@ fn assign_formants(raw: &[f32; 4], last_confirmed: &[f32; 4]) -> [f32; 4] {
         if slot_taken[slot] || claimed[ci] {
             continue;
         }
-        // sanity ceiling — a jump this big ain't continuity, it's a different formant
+        // sanity ceiling - a jump this big ain't continuity, it's a different formant
         // entirely, let pass 2 handle it via static seeding instead
         const MAX_CONTINUITY_JUMP_HZ: f32 = 400.0;
         if dist > MAX_CONTINUITY_JUMP_HZ {
