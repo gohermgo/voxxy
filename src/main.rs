@@ -72,6 +72,17 @@ impl Drop for WriterThread {
     }
 }
 
+// at least 16, at most 18 for our 16k
+//
+// this should be configurable or like
+// we should do math or smth, but idk
+// those formulas yet
+const LPC_ORDER: usize = 18;
+
+/// napkin math gave me 400 for 44100 hz downsampled to 16000 hz,
+/// provided we want the typical frame-duration of 25ms
+const LPC_WINDOW_LEN: usize = 400;
+
 fn main() -> anyhow::Result<()> {
     use audio_thread::AudioThread;
     use worker_thread::WorkerThread;
@@ -93,14 +104,6 @@ fn main() -> anyhow::Result<()> {
 
     let (audio_thread, resampler_cfg) = AudioThread::new(input_dev, sample_tx)?;
 
-    // #[expect(dead_code)]
-    // let spec = hound::WavSpec {
-    //     channels: 1,
-    //     sample_rate: resampler_cfg.target_rate,
-    //     bits_per_sample: 32,
-    //     sample_format: hound::SampleFormat::Float,
-    // };
-
     let sample_rate = resampler_cfg.target_rate;
     let worker_thread = WorkerThread::new(resampler_cfg, sample_rx, resampled_tx)?;
 
@@ -110,13 +113,15 @@ fn main() -> anyhow::Result<()> {
         hop_size: 67,
     };
 
-    let mut lpc_buffers = LpcBuffers::new(lpc_framer.window_size, LPC_ORDER);
-
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let (formant_tx, formant_rx) = crossbeam::channel::bounded::<[f32; 4]>(64);
 
-    let _validation_thread = thread::spawn({
+    let mut pipeline = LpcPipeline::<LPC_ORDER, LPC_WINDOW_LEN, { LPC_ORDER + 1 }>::default();
+    let mut formants = vec![0.; LPC_ORDER / 2].into_boxed_slice();
+
+    // forwards to the framer
+    let _lpc_thread = thread::spawn({
         tracing::info!("making lpc thread...");
         let stop = Arc::clone(&stop_flag);
         move || -> anyhow::Result<()> {
@@ -126,15 +131,20 @@ fn main() -> anyhow::Result<()> {
                     tracing::info!("leaving lpc thread!");
                     break Ok(());
                 }
+
                 // blocks until data arrives OR timeout, no spin
                 match resampled_rx.recv_timeout(std::time::Duration::from_millis(5)) {
                     Ok(new_samples) => {
-                        lpc_framer.push_and_maybe_analyze(&new_samples, |in_buf| {
-                            lpc_buffers.run_pipeline(in_buf, LPC_ORDER, sample_rate, 400.0, 0.15);
+                        lpc_framer.push_and_maybe_analyze_arr(&new_samples, |x| {
+                            if is_voiced(x, 0.15) {
+                                let (b, _a) = pipeline.run_once(x);
+                                lpc_extract_formants(b, &mut formants, sample_rate, 400.0);
+                                // self.formant.fill(0.0);
+                            }
+                            // lpc_buffers.run_pipeline(in_buf, LPC_ORDER, sample_rate, 400.0, 0.15);
                             let mut f = [0f32; 4];
-                            f[..lpc_buffers.formant.len().min(4)].copy_from_slice(
-                                &lpc_buffers.formant[..lpc_buffers.formant.len().min(4)],
-                            );
+                            f[..formants.len().min(4)]
+                                .copy_from_slice(&formants[..formants.len().min(4)]);
                             let _ = formant_tx.try_send(f);
                         });
                     }
@@ -251,7 +261,7 @@ impl eframe::App for FormantApp {
                 // plot gets everything above the legend
                 Plot::new("formants")
                     .include_y(0.0)
-                    .include_y(8000.0)
+                    .include_y(6000.0)
                     .show(ui, |plot_ui| {
                         for fi in 0..4 {
                             let pts: PlotPoints = self
@@ -317,88 +327,161 @@ impl eframe::App for FormantApp {
 //     further from 1.0 = probably noise/spurious pole, to be filtered out)
 //     sort surviving roots by frequency asc., first 3-4 are ur F1-F4
 
+fn hamming_window_coefficient(i: usize, n: usize) -> f32 {
+    use core::f32::consts::PI;
+
+    let angle = 2. * PI * i as f32 / (n as f32 - 1.);
+    0.54 - (0.46 * f32::cos(angle))
+}
+
 /// applies pre-emphasis filter then a Hamming window, in that order.
 /// out_buf[i] corresponds to in_buf[i], same length required.
-fn lpc_window_and_pre_emphasize(in_buf: &[f32], out_buf: &mut [f32]) {
-    debug_assert_eq!(
-        out_buf.len(),
-        in_buf.len(),
-        "input and output buffer sizes need to match"
-    );
-
-    let n = in_buf.len();
+fn lpc_window_and_pre_emphasize_arr<const N: usize>(x_in: &[f32; N], x_out: &mut [f32; N]) {
+    // only for the 0-th case
+    x_out[0] = x_in[0] * hamming_window_coefficient(0, N);
 
     const PRE_EMPHASIS: f32 = 0.97;
 
-    for i in 0..n {
-        // pre-emphasis: y[n] = x[n] - 0.97*x[n-1], x[-1] treated as 0
-        let prev = if i == 0 { 0.0 } else { in_buf[i - 1] };
-        let emphasized = in_buf[i] - PRE_EMPHASIS * prev;
-
-        // hamming window coefficient for this index
-        let hamming_window_coeff =
-            0.54 - 0.46 * (2.0 * core::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
-
-        out_buf[i] = emphasized * hamming_window_coeff;
+    // loop from 1 to the end
+    for i in 1..N {
+        // pre-emphasis: y[n] = x[n] - 0.97*x[n-1], x[-1] treated as 0, but we handle the 0 case outside
+        let e = x_in[i] - PRE_EMPHASIS * x_in[i - 1];
+        x_out[i] = e * hamming_window_coefficient(i, N)
     }
 }
 
-fn lpc_autocorrelate(in_buf: &[f32], out_buf: &mut [f32], lpc_order: usize) {
-    let n = in_buf.len();
-    debug_assert!(lpc_order < n && out_buf.len() > lpc_order);
-
-    for lag in 0..=lpc_order {
-        let mut sum = 0.0;
-        for t in lag..n {
-            sum += in_buf[t] * in_buf[t - lag];
-        }
-        out_buf[lag] = sum;
-    }
-}
-
-/// `autocorrelation_buf` is input autocorrelation vector of size `p + 1`
-/// `output_coeff_buf` is output coefficient buffer of size `p`
-/// `reflection_coeff_buf` is reflection coefficient buffer of size `p`
-fn lpc_levinson_durbin(
-    autocorrelation_buf: &[f32],
-    output_coeff_buf: &mut [f32],
-    reflection_coeff_buf: &mut [f32],
+const fn lpc_autocorrelate_arr<const ORDER: usize, const N: usize, const X_A_LEN: usize>(
+    x: &[f32; N],
+    x_a: &mut [f32; X_A_LEN],
 ) {
-    let n = output_coeff_buf.len();
+    // ugly compile-time assertion of bounds
+    struct Assert<const LHS: usize, const RHS: usize>;
+    #[allow(dead_code)]
+    impl<const LHS: usize, const RHS: usize> Assert<LHS, RHS> {
+        const OK: () = assert!(
+            LHS - 1 == RHS,
+            "Autocorrelation buffer must be exactly 1 greater than LPC order!"
+        );
+    }
+    let _: () = Assert::<X_A_LEN, ORDER>::OK;
+
+    let mut i = 0;
+    while i <= ORDER {
+        let mut sum = 0.;
+        let mut n = i;
+
+        while n < N {
+            sum += x[n] * x[n - i];
+
+            n += 1;
+        }
+
+        x_a[i] = sum;
+
+        i += 1;
+    }
+}
+
+const fn lpc_levinson_durbin_arr<const ORDER: usize, const X_A_LEN: usize>(
+    x_a: &[f32; X_A_LEN],
+    b: &mut [f32; ORDER],
+    a: &mut [f32; ORDER],
+) {
+    const fn feedback_coefficient<const ORDER: usize, const X_A_LEN: usize>(
+        i: usize,
+        x_a: &[f32; X_A_LEN],
+        b: &[f32; ORDER],
+        e: f32,
+    ) -> f32 {
+        let mut sum = 0.;
+
+        let mut j = 0;
+        while j < i {
+            sum += b[j] * x_a[i - j];
+
+            j += 1;
+        }
+
+        -(x_a[i + 1] + sum) / e
+    }
+
+    const fn update_forward_coefficients<const ORDER: usize>(
+        i: usize,
+        b: &mut [f32; ORDER],
+        a_i: f32,
+    ) {
+        let midpoint = i.div_ceil(2);
+
+        let mut j = 0;
+        while j < midpoint {
+            let a_j = b[j];
+            if j == i - 1 - j {
+                // center element, iff i is even (meaning we probably optimize out the branch due
+                // to how common the indexing pattern is)
+                b[j] = a_j + a_i * a_j;
+            } else {
+                let a_back = b[i - 1 - j];
+                b[j] = a_j + a_i * a_back;
+                b[i - 1 - j] = a_back + a_i * a_j;
+            }
+
+            j += 1;
+        }
+    }
 
     // initial error energy
-    let mut e = autocorrelation_buf[0];
+    let mut e = x_a[0];
 
-    for i in 0..n {
-        // 1. compute reflection coefficient (PARCOR)
-        let mut sum = 0.0;
-        for j in 0..i {
-            sum += output_coeff_buf[j] * autocorrelation_buf[i - j];
+    let mut i = 0;
+    while i < ORDER {
+        // 1. feedback coefficient (PARCOR)
+        let a_i = feedback_coefficient(i, x_a, b, e);
+        a[i] = a_i;
+
+        // 2. update existing coefficients from edges inwards
+        update_forward_coefficients(i, b, a_i);
+        b[i] = a_i;
+
+        e *= 1.0 - a_i * a_i;
+
+        i += 1;
+    }
+}
+
+struct FilterCoefficients<const ORDER: usize> {
+    /// the `forward` coefficients for
+    /// the `auto-regressive` filter
+    b: [f32; ORDER],
+    /// the `feedback` coefficients for
+    /// the `auto-regressive` filter
+    a: [f32; ORDER],
+}
+
+impl<const ORDER: usize> Default for FilterCoefficients<ORDER> {
+    fn default() -> Self {
+        FilterCoefficients {
+            b: [0.; ORDER],
+            a: [0.; ORDER],
         }
-        let reflection_coeff = -(autocorrelation_buf[i + 1] + sum) / e;
-        reflection_coeff_buf[i] = reflection_coeff;
+    }
+}
 
-        // 2. update existing coefficients from the edges inwards
-        let midpoint = i.div_ceil(2);
-        for j in 0..midpoint {
-            let back_idx = i - 1 - j;
-            let output_coeff = output_coeff_buf[j];
-
-            if j == back_idx {
-                // center element, iff i is even
-                output_coeff_buf[j] = output_coeff + reflection_coeff * output_coeff;
-            } else {
-                let output_coeff_back = output_coeff_buf[back_idx];
-                output_coeff_buf[j] = output_coeff + reflection_coeff * output_coeff_back;
-                output_coeff_buf[back_idx] = output_coeff_back + reflection_coeff * output_coeff;
-            }
-        }
-
-        // write to i for the first time i suppose...
-        output_coeff_buf[i] = reflection_coeff;
-
-        // 3. update the error energy
-        e *= 1.0 - reflection_coeff * reflection_coeff;
+impl<const ORDER: usize> FilterCoefficients<ORDER> {
+    /// estimate the filter-coefficients in-place, from the provided
+    /// signal `x`
+    ///
+    /// it is assumed that `x` has already been windowed and pre-emphasized as wanted
+    ///
+    /// the autocorrelation buffer is request such that the caller
+    /// can choose where the intermediate is stored
+    const fn estimate<const X_LEN: usize, const X_A_LEN: usize>(
+        &mut self,
+        x: &[f32; X_LEN],
+        x_a: &mut [f32; X_A_LEN],
+    ) -> (&[f32; ORDER], &[f32; ORDER]) {
+        lpc_autocorrelate_arr::<ORDER, X_LEN, X_A_LEN>(x, x_a);
+        lpc_levinson_durbin_arr(x_a, &mut self.b, &mut self.a);
+        (&self.b, &self.a)
     }
 }
 
@@ -465,73 +548,26 @@ fn lpc_extract_formants(
     out_buf[0..count].sort_by(|a, b| a.partial_cmp(b).unwrap());
 }
 
-// at least 16, at most 18 for our 16k
-//
-// this should be configurable or like
-// we should do math or smth, but idk
-// those formulas yet
-const LPC_ORDER: usize = 18;
-
-struct LpcBuffers {
-    cleaned_data: Vec<f32>,
-    autocorrelation: Vec<f32>,
-    output_coeff: Vec<f32>,
-    reflection_coeff: Vec<f32>,
-    formant: Vec<f32>,
-}
-
 fn is_voiced(in_buf: &[f32], threshold: f32) -> bool {
     let rms = (in_buf.iter().map(|s| s * s).sum::<f32>() / in_buf.len() as f32).sqrt();
     rms > threshold
 }
 
-impl LpcBuffers {
-    pub fn new(window_size: usize, lpc_order: usize) -> LpcBuffers {
-        LpcBuffers {
-            cleaned_data: vec![0.0; window_size],
-            autocorrelation: vec![0.0; lpc_order + 1],
-            output_coeff: vec![0.0; lpc_order],
-            reflection_coeff: vec![0.0; lpc_order],
-            formant: vec![0.0; lpc_order / 2],
-        }
-    }
-
-    pub fn run_pipeline(
-        &mut self,
-        in_buf: &[f32],
-        lpc_order: usize,
-        sample_rate: u32,
-        bandwidth_threshold_max: f32,
-        unvoiced_threshold: f32,
-    ) {
-        if !is_voiced(in_buf, unvoiced_threshold) {
-            self.formant.fill(0.0);
-            return;
-        }
-        lpc_window_and_pre_emphasize(in_buf, &mut self.cleaned_data);
-        lpc_autocorrelate(&self.cleaned_data, &mut self.autocorrelation, lpc_order);
-        lpc_levinson_durbin(
-            &self.autocorrelation,
-            &mut self.output_coeff,
-            &mut self.reflection_coeff,
-        );
-        lpc_extract_formants(
-            &self.output_coeff,
-            &mut self.formant,
-            sample_rate,
-            bandwidth_threshold_max,
-        );
-    }
-}
-
+/// basically we need to ensure the window size matches exactly
+/// what parameters we precalculated.
+///
+/// for 16kHz => 400 samples (trust me ish, u can do the math but its not fun)
 struct LpcFramer {
+    /// we store samples as they arrive from the [audio thread](audio_thread::AudioThread)
     accumulator: Vec<f32>,
+    #[expect(dead_code)]
     window_size: usize,
     // < window_size for overlapping frames, smoother formant tracking
     hop_size: usize,
 }
 
 impl LpcFramer {
+    #[expect(dead_code)]
     fn push_and_maybe_analyze(&mut self, new_samples: &[f32], mut on_frame: impl FnMut(&[f32])) {
         self.accumulator.extend_from_slice(new_samples);
         while self.accumulator.len() >= self.window_size {
@@ -539,8 +575,51 @@ impl LpcFramer {
             self.accumulator.drain(..self.hop_size);
         }
     }
+    fn push_and_maybe_analyze_arr<const N: usize>(
+        &mut self,
+        new_samples: &[f32],
+        mut on_frame: impl FnMut(&[f32; N]),
+    ) {
+        self.accumulator.extend_from_slice(new_samples);
+        while self.accumulator.len() >= N {
+            on_frame(self.accumulator[..N].as_array().unwrap());
+            self.accumulator.drain(..self.hop_size);
+        }
+    }
 }
 
-mod signal {
-    pub struct SignalBuf(Vec<f32>);
+struct LpcPipeline<
+    const ORDER: usize = LPC_ORDER,
+    const WINDOW_LEN: usize = LPC_WINDOW_LEN,
+    const AUTOCORR_LEN: usize = { LPC_ORDER + 1 },
+> {
+    filter_coeffs: FilterCoefficients<ORDER>,
+    window: [f32; WINDOW_LEN],
+    autocorrelation: [f32; AUTOCORR_LEN],
+}
+
+impl<const ORDER: usize, const WINDOW_LEN: usize, const AUTOCORR_LEN: usize> Default
+    for LpcPipeline<ORDER, WINDOW_LEN, AUTOCORR_LEN>
+{
+    fn default() -> Self {
+        LpcPipeline {
+            filter_coeffs: FilterCoefficients::default(),
+            window: [0.; WINDOW_LEN],
+            autocorrelation: [0.; AUTOCORR_LEN],
+        }
+    }
+}
+
+impl<const ORDER: usize, const WINDOW_LEN: usize, const AUTOCORR_LEN: usize>
+    LpcPipeline<ORDER, WINDOW_LEN, AUTOCORR_LEN>
+{
+    /// runs the pipeline until the end of the levinson-durbin step, leaving the caller
+    /// to extract formants (this part is now squeaky clean in other words, albeit contrived)
+    ///
+    /// returns a tuple with `(forward_coefficients, feedback_coefficients)`
+    fn run_once(&mut self, x: &[f32; WINDOW_LEN]) -> (&[f32; ORDER], &[f32; ORDER]) {
+        lpc_window_and_pre_emphasize_arr(x, &mut self.window);
+        self.filter_coeffs
+            .estimate(&self.window, &mut self.autocorrelation)
+    }
 }

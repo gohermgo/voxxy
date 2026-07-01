@@ -1,4 +1,13 @@
+//! # the audio-thread
+//!
+//! basically all it does is forward samples through a [`spsc queue`](heapless::spsc::Queue),
+//! down the line to the next component in the signal chain
+//!
+//! the _thread_ in question is not managed by us, and instead comes as a natural beneficial consequence
+//! of using [`cpal`]
+
 use crate::ResamplerCfg;
+
 use heapless::spsc::Producer;
 
 pub struct AudioThread {
