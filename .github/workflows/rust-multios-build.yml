@@ -1,5 +1,9 @@
 name: rust-multios-build
 
+# this workflow is just for superstition's sake
+#
+# if u build ON the os, surely it runs on it too
+
 on:
   push:
   pull_request:
