@@ -55,11 +55,13 @@ impl LpcThread {
                     // blocks until data arrives OR timeout, no spin
                     match resampled_rx.recv_timeout(std::time::Duration::from_millis(5)) {
                         Ok(new_samples) => {
-                            lpc_framer.push_and_maybe_analyze_arr(&new_samples, |x| {
-                                if is_voiced(x, 0.15) {
-                                    let (b, _a) = pipeline.run_once(x);
+                            lpc_framer.push_and_maybe_analyze_arr(&new_samples, |sample_window| {
+                                if is_voiced(sample_window, 0.15) {
+                                    let (b, _a) = pipeline.run_once(sample_window);
                                     lpc_extract_formants(b, &mut formants, sample_rate, 400.0);
                                 } else {
+                                    // if this is not a voiced sample-window it contains no formants and
+                                    // we must clear the buffer (which is static from the perspective of this thread).
                                     formants.fill(0.0);
                                 }
 
