@@ -59,10 +59,15 @@ impl LpcThread {
                                 if is_voiced(x, 0.15) {
                                     let (b, _a) = pipeline.run_once(x);
                                     lpc_extract_formants(b, &mut formants, sample_rate, 400.0);
+                                } else {
+                                    formants.fill(0.0);
                                 }
+
                                 let mut f = [0f32; 4];
+
                                 f[..formants.len().min(4)]
                                     .copy_from_slice(&formants[..formants.len().min(4)]);
+
                                 let _ = formant_tx.try_send(f);
                             });
                         }
