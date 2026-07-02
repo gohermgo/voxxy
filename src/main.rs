@@ -1,4 +1,7 @@
+use std::collections::VecDeque;
+
 use cpal::traits::HostTrait;
+use crossbeam::channel::Receiver;
 use heapless::spsc::Queue;
 use tracing::level_filters::STATIC_MAX_LEVEL;
 
@@ -61,13 +64,13 @@ fn main() -> anyhow::Result<()> {
         "voxxy",
         eframe::NativeOptions::default(),
         Box::new(|_cc| {
-            Ok(Box::new(FormantApp {
-                formant_rx,
-                history: std::collections::VecDeque::with_capacity(history_size),
-                last_valid: [0.; 4],
-                smoothed: [0.; 4],
-                is_voiced: false,
-                history_threshold: history_size,
+            Ok(Box::new(Voxxy {
+                formant_plot: FormantPlot {
+                    rx: formant_rx,
+                    history: VecDeque::with_capacity(history_size),
+                    history_threshold: history_size,
+                    last_valid: [0.; 4],
+                },
             }))
         }),
     )?;
@@ -151,119 +154,204 @@ fn assign_formants(raw: &[f32; 4], last_confirmed: &[f32; 4]) -> [f32; 4] {
 
     assigned
 }
-struct FormantApp {
-    formant_rx: crossbeam::channel::Receiver<[f32; 4]>,
-    history: std::collections::VecDeque<[f32; 4]>,
-    last_valid: [f32; 4],
-    // for EMA, makes data smoother
-    smoothed: [f32; 4],
-    is_voiced: bool,
-    history_threshold: usize,
+
+struct Voxxy {
+    formant_plot: FormantPlot,
 }
 
-impl eframe::App for FormantApp {
+impl eframe::App for Voxxy {
     fn logic(&mut self, _: &egui::Context, _: &mut eframe::Frame) {
-        while let Ok(f) = self.formant_rx.try_recv() {
-            let f = assign_formants(&f, &self.last_valid);
-
-            // only update if at least F1 is real, otherwise keep last known
-            if f[0] > 0.0 {
-                self.is_voiced = true;
-                const ALPHA: f32 = 0.3;
-                const SNAP_THRESHOLD_HZ: f32 = 300.0; // jump bigger than this = snap
-
-                #[allow(clippy::needless_range_loop)]
-                for i in 0..4 {
-                    if f[i] > 0.0 {
-                        if self.last_valid[i] == 0.0
-                            || (f[i] - self.smoothed[i]).abs() > SNAP_THRESHOLD_HZ
-                        {
-                            // big jump or coming from silence = snap immediately
-                            self.smoothed[i] = f[i];
-                        } else {
-                            // small variation = smooth it
-                            self.smoothed[i] = ALPHA * f[i] + (1.0 - ALPHA) * self.smoothed[i];
-                        }
-                    }
-                }
-                self.last_valid = self.smoothed;
-                if self.history.len() >= self.history_threshold {
-                    self.history.pop_front();
-                }
-                self.history.push_back(self.smoothed);
-            } else {
-                // voiced -> silence: zero out last_valid so next onset snaps
-                self.is_voiced = false;
-                self.last_valid = [0.0; 4];
-            }
-        }
+        self.formant_plot.update();
     }
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        const COLORS: [egui::Color32; 4] = [
-            egui::Color32::from_rgb(220, 80, 80),  // F1 red
-            egui::Color32::from_rgb(80, 140, 220), // F2 blue
-            egui::Color32::from_rgb(140, 200, 80), // F3 green
-            egui::Color32::from_rgb(200, 80, 200), // F4 pink
-        ];
         egui::CentralPanel::default().show(ui, |ui| {
             // bottom legend FIRST so plot takes remaining space
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.horizontal(|ui| {
                     #[allow(clippy::needless_range_loop)]
                     for fi in 0..4 {
-                        let hz = self.last_valid[fi];
-                        let text = if self.is_voiced && self.smoothed[fi] > 0.0 {
-                            format!("F{}  {:.0} Hz", fi + 1, hz)
-                        } else {
-                            format!("F{}  ---", fi + 1)
-                        };
+                        let hz = self.formant_plot.last_valid[fi];
+
+                        let text = format!("F{}  {:.0} Hz", fi + 1, hz);
+
                         ui.label(
                             egui::RichText::new(text)
-                                .color(COLORS[fi])
+                                .color(FORMANT_COLORS[fi])
                                 .strong()
                                 .size(18.0),
                         );
+
                         ui.add_space(24.0);
                     }
                 });
 
                 // plot gets everything above the legend
-                Plot::new("formants")
-                    .include_y(0.0)
-                    .include_y(6000.0)
-                    .default_y_bounds(0.0, 6000.0)
-                    .show(ui, |plot_ui| {
-                        for fi in 0..4 {
-                            let pts: PlotPoints = self
-                                .history
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, f)| f[fi] > 0.0)
-                                .map(|(i, f)| [i as f64, f[fi] as f64])
-                                .collect();
-
-                            plot_ui.points(
-                                Points::new(format!("F{}", fi + 1), pts)
-                                    .radius(3.0)
-                                    .color(COLORS[fi]),
-                            );
-
-                            // bold label floating on the line itself
-                            if self.last_valid[fi] > 0.0 {
-                                plot_ui.text(egui_plot::Text::new(
-                                    format!("label-F{}", fi + 1),
-                                    egui_plot::PlotPoint::new(295.0, self.last_valid[fi] as f64),
-                                    egui::RichText::new(format!("F{}", fi + 1))
-                                        .color(COLORS[fi])
-                                        .strong()
-                                        .size(15.0),
-                                ));
-                            }
-                        }
-                    });
+                self.formant_plot.show(ui);
             });
         });
 
         ui.request_repaint();
     }
 }
+
+struct FormantPlot {
+    rx: Receiver<[f32; 4]>,
+    history: VecDeque<[f32; 4]>,
+    history_threshold: usize,
+    last_valid: [f32; 4],
+}
+
+const FORMANT_COLORS: [egui::Color32; 4] = [
+    egui::Color32::from_rgb(220, 80, 80),  // F1 red
+    egui::Color32::from_rgb(80, 140, 220), // F2 blue
+    egui::Color32::from_rgb(140, 200, 80), // F3 green
+    egui::Color32::from_rgb(200, 80, 200), // F4 pink
+];
+
+impl FormantPlot {
+    /// drains all new values from the stored receiver
+    fn update(&mut self) {
+        let mut received_and_valid = 0;
+        while let Ok(raw_formant_frame) = self.rx.try_recv() {
+            let formants = assign_formants(&raw_formant_frame, &self.last_valid);
+
+            // F1 must be real, otherwise we ignore this frame
+            if formants[0] > 0.0 {
+                received_and_valid += 1;
+                self.last_valid = formants;
+
+                if self.history.len() >= self.history_threshold {
+                    self.history.pop_front();
+                }
+
+                self.history.push_back(self.last_valid);
+            }
+        }
+        if received_and_valid != 0 {
+            println!("received {received_and_valid} formant-frames this tick");
+        }
+    }
+    fn show(&self, ui: &mut egui::Ui) -> egui_plot::PlotResponse<()> {
+        Plot::new("formants")
+            .include_y(0.0)
+            .include_y(6000.0)
+            .default_y_bounds(0.0, 6000.0)
+            .show(ui, |plot_ui| {
+                // here we iterate over each formant per index... strange...
+                #[expect(clippy::needless_range_loop)]
+                for fi in 0..4 {
+                    render_formant_by_index(plot_ui, &self.history, fi, 3.0, FORMANT_COLORS[fi]);
+
+                    // bold label floating on the line itself
+                    if self.last_valid[fi] > 0.0 {
+                        plot_ui.text(egui_plot::Text::new(
+                            format!("label-F{}", fi + 1),
+                            egui_plot::PlotPoint::new(295.0, self.last_valid[fi] as f64),
+                            egui::RichText::new(format!("F{}", fi + 1))
+                                .color(FORMANT_COLORS[fi])
+                                .strong()
+                                .size(15.0),
+                        ));
+                    }
+                }
+            })
+    }
+}
+
+fn render_formant_by_index(
+    plot_ui: &mut egui_plot::PlotUi,
+    formant_history: &std::collections::VecDeque<[f32; 4]>,
+    formant_index: usize,
+    point_radius: f32,
+    point_color: egui::Color32,
+) {
+    // this represents all points for this specific formant (i.e. F0, F1, F2, or F3)
+    // present in the history.
+    let points: PlotPoints = formant_history
+        .iter()
+        .enumerate()
+        .filter_map(|(frame_index, formants)| {
+            let current_formant = formants[formant_index];
+            if current_formant > 0.0 {
+                // we use the frame-index as the x-coordinate for the formant
+                Some([frame_index as f64, current_formant as f64])
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    plot_ui.points(
+        Points::new(format!("F{}", formant_index + 1), points)
+            .radius(point_radius)
+            .color(point_color),
+    )
+}
+
+// fn render_plot(ui: &mut eframe::egui::Ui) {
+//     const COLORS: [egui::Color32; 4] = [
+//         egui::Color32::from_rgb(220, 80, 80),  // F1 red
+//         egui::Color32::from_rgb(80, 140, 220), // F2 blue
+//         egui::Color32::from_rgb(140, 200, 80), // F3 green
+//         egui::Color32::from_rgb(200, 80, 200), // F4 pink
+//     ];
+//     egui::CentralPanel::default().show(ui, |ui| {
+//         // bottom legend FIRST so plot takes remaining space
+//         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+//             ui.horizontal(|ui| {
+//                 #[allow(clippy::needless_range_loop)]
+//                 for fi in 0..4 {
+//                     let hz = self.last_valid[fi];
+//                     let text = if self.is_voiced && self.smoothed[fi] > 0.0 {
+//                         format!("F{}  {:.0} Hz", fi + 1, hz)
+//                     } else {
+//                         format!("F{}  ---", fi + 1)
+//                     };
+//                     ui.label(
+//                         egui::RichText::new(text)
+//                             .color(COLORS[fi])
+//                             .strong()
+//                             .size(18.0),
+//                     );
+//                     ui.add_space(24.0);
+//                 }
+//             });
+
+//             // plot gets everything above the legend
+//             Plot::new("formants")
+//                 .include_y(0.0)
+//                 .include_y(6000.0)
+//                 .default_y_bounds(0.0, 6000.0)
+//                 .show(ui, |plot_ui| {
+//                     for fi in 0..4 {
+//                         let pts: PlotPoints = self
+//                             .history
+//                             .iter()
+//                             .enumerate()
+//                             .filter(|(_, f)| f[fi] > 0.0)
+//                             .map(|(i, f)| [i as f64, f[fi] as f64])
+//                             .collect();
+
+//                         plot_ui.points(
+//                             Points::new(format!("F{}", fi + 1), pts)
+//                                 .radius(3.0)
+//                                 .color(COLORS[fi]),
+//                         );
+
+//                         // bold label floating on the line itself
+//                         if self.last_valid[fi] > 0.0 {
+//                             plot_ui.text(egui_plot::Text::new(
+//                                 format!("label-F{}", fi + 1),
+//                                 egui_plot::PlotPoint::new(295.0, self.last_valid[fi] as f64),
+//                                 egui::RichText::new(format!("F{}", fi + 1))
+//                                     .color(COLORS[fi])
+//                                     .strong()
+//                                     .size(15.0),
+//                             ));
+//                         }
+//                     }
+//                 });
+//         });
+//     });
+//     ui.request_repaint();
+// }
