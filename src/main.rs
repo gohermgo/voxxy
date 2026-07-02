@@ -202,22 +202,20 @@ struct FormantPlot {
 }
 
 const FORMANT_COLORS: [egui::Color32; 4] = [
-    egui::Color32::from_rgb(220, 80, 80),  // F1 red
-    egui::Color32::from_rgb(80, 140, 220), // F2 blue
-    egui::Color32::from_rgb(140, 200, 80), // F3 green
-    egui::Color32::from_rgb(200, 80, 200), // F4 pink
+    egui::Color32::from_rgb(224, 91, 105),  // F1 coral-red
+    egui::Color32::from_rgb(76, 175, 220),  // F2 sky-blue
+    egui::Color32::from_rgb(129, 199, 132), // F3 sage-green
+    egui::Color32::from_rgb(206, 108, 216), // F4 orchid
 ];
 
 impl FormantPlot {
     /// drains all new values from the stored receiver
     fn update(&mut self) {
-        let mut received_and_valid = 0;
         while let Ok(raw_formant_frame) = self.rx.try_recv() {
             let formants = assign_formants(&raw_formant_frame, &self.last_valid);
 
             // F1 must be real, otherwise we ignore this frame
             if formants[0] > 0.0 {
-                received_and_valid += 1;
                 self.last_valid = formants;
 
                 if self.history.len() >= self.history_threshold {
@@ -226,9 +224,6 @@ impl FormantPlot {
 
                 self.history.push_back(self.last_valid);
             }
-        }
-        if received_and_valid != 0 {
-            println!("received {received_and_valid} formant-frames this tick");
         }
     }
     fn show(&self, ui: &mut egui::Ui) -> egui_plot::PlotResponse<()> {
@@ -242,11 +237,14 @@ impl FormantPlot {
                 for fi in 0..4 {
                     render_formant_by_index(plot_ui, &self.history, fi, 3.0, FORMANT_COLORS[fi]);
 
+                    let cursor_label_x =
+                        usize::min(self.history.len(), self.history_threshold) as f64 + 10.;
+
                     // bold label floating on the line itself
                     if self.last_valid[fi] > 0.0 {
                         plot_ui.text(egui_plot::Text::new(
                             format!("label-F{}", fi + 1),
-                            egui_plot::PlotPoint::new(295.0, self.last_valid[fi] as f64),
+                            egui_plot::PlotPoint::new(cursor_label_x, self.last_valid[fi] as f64),
                             egui::RichText::new(format!("F{}", fi + 1))
                                 .color(FORMANT_COLORS[fi])
                                 .strong()
