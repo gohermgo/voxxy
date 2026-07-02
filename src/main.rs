@@ -71,6 +71,7 @@ fn main() -> anyhow::Result<()> {
                     history_threshold: history_size,
                     last_valid: [0.; 4],
                 },
+                phoneme_selection: phoneme::PhonemeSelection::default(),
             }))
         }),
     )?;
@@ -157,6 +158,7 @@ fn assign_formants(raw: &[f32; 4], last_confirmed: &[f32; 4]) -> [f32; 4] {
 
 struct Voxxy {
     formant_plot: FormantPlot,
+    phoneme_selection: phoneme::PhonemeSelection,
 }
 
 impl eframe::App for Voxxy {
@@ -185,8 +187,9 @@ impl eframe::App for Voxxy {
                     }
                 });
 
+                phoneme::phoneme_combobox(ui, &mut self.phoneme_selection);
                 // plot gets everything above the legend
-                self.formant_plot.show(ui);
+                self.formant_plot.show(ui, self.phoneme_selection.active);
             });
         });
 
@@ -226,7 +229,13 @@ impl FormantPlot {
             }
         }
     }
-    fn show(&self, ui: &mut egui::Ui) -> egui_plot::PlotResponse<()> {
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        active_phoneme: Option<phoneme::Phoneme>,
+    ) -> egui_plot::PlotResponse<()> {
+        // TODO: maybe add a split-view? like instead of having all formants on one,
+        // have one quadrant per formant? could be a lot easier to use
         Plot::new("formants")
             .include_y(0.0)
             .include_y(6000.0)
@@ -251,6 +260,16 @@ impl FormantPlot {
                                 .size(15.0),
                         ));
                     }
+                }
+
+                // make sure to draw the target overlay after the plot!
+                if let Some(phoneme) = active_phoneme {
+                    phoneme::draw_target_overlay(
+                        plot_ui,
+                        phoneme::target_for(phoneme),
+                        &FORMANT_COLORS,
+                        (0., self.history.len() as f64),
+                    );
                 }
             })
     }
@@ -285,3 +304,5 @@ fn render_formant_by_index(
             .color(point_color),
     )
 }
+
+mod phoneme;
