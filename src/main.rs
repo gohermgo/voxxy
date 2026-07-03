@@ -72,6 +72,7 @@ fn main() -> anyhow::Result<()> {
                     last_valid: [0.; 4],
                 },
                 phoneme_selection: phoneme::PhonemeSelection::default(),
+                view_mode: phoneme::ViewMode::default(),
             }))
         }),
     )?;
@@ -159,6 +160,7 @@ fn assign_formants(raw: &[f32; 4], last_confirmed: &[f32; 4]) -> [f32; 4] {
 struct Voxxy {
     formant_plot: FormantPlot,
     phoneme_selection: phoneme::PhonemeSelection,
+    view_mode: phoneme::ViewMode,
 }
 
 impl eframe::App for Voxxy {
@@ -187,9 +189,14 @@ impl eframe::App for Voxxy {
                     }
                 });
 
-                phoneme::phoneme_combobox(ui, &mut self.phoneme_selection);
+                ui.horizontal(|ui| {
+                    phoneme::phoneme_combobox(ui, &mut self.phoneme_selection);
+                    phoneme::view_mode_toggle(ui, &mut self.view_mode);
+                });
+
                 // plot gets everything above the legend
-                self.formant_plot.show(ui, self.phoneme_selection.active);
+                self.formant_plot
+                    .show(ui, self.phoneme_selection.active, self.view_mode);
             });
         });
 
@@ -211,6 +218,10 @@ const FORMANT_COLORS: [egui::Color32; 4] = [
     egui::Color32::from_rgb(206, 108, 216), // F4 orchid
 ];
 
+/// broad realistic ranges for formants
+const FORMANT_BOUNDS: [(f32, f32); 4] =
+    [(150., 1200.), (500., 3500.), (1500., 4500.), (2500., 5500.)];
+
 impl FormantPlot {
     /// drains all new values from the stored receiver
     fn update(&mut self) {
@@ -229,27 +240,35 @@ impl FormantPlot {
             }
         }
     }
-    fn show(
+    /// draws a single formant plot, by index. main use is for split-view
+    fn draw_formant_plot(
         &mut self,
         ui: &mut egui::Ui,
         active_phoneme: Option<phoneme::Phoneme>,
-    ) -> egui_plot::PlotResponse<()> {
-        // TODO: maybe add a split-view? like instead of having all formants on one,
-        // have one quadrant per formant? could be a lot easier to use
-        Plot::new("formants")
-            .include_y(0.0)
-            .include_y(6000.0)
-            .default_y_bounds(0.0, 6000.0)
-            .show(ui, |plot_ui| {
-                // here we iterate over each formant per index... strange...
-                #[expect(clippy::needless_range_loop)]
-                for fi in 0..4 {
+        fi: usize,
+        (w, h): (f32, f32),
+    ) -> egui::InnerResponse<egui_plot::PlotResponse<()>> {
+        ui.scope(|ui| {
+            ui.label(
+                egui::RichText::new(format!("F{}", fi + 1))
+                    .color(FORMANT_COLORS[fi])
+                    .strong(),
+            );
+
+            let (y_min, y_max) = FORMANT_BOUNDS[fi];
+
+            Plot::new(format!("formant_plot_split_{fi}"))
+                .height(h)
+                .width(w)
+                .min_size(egui::Vec2 { x: w, y: h })
+                .include_y(y_min)
+                .include_y(y_max)
+                .default_y_bounds(y_min as f64, y_max as f64)
+                .show(ui, |plot_ui| {
                     render_formant_by_index(plot_ui, &self.history, fi, 3.0, FORMANT_COLORS[fi]);
 
                     let cursor_label_x =
-                        usize::min(self.history.len(), self.history_threshold) as f64 + 10.;
-
-                    // bold label floating on the line itself
+                        usize::min(self.history.len(), self.history_threshold) as f64 + 10.0;
                     if self.last_valid[fi] > 0.0 {
                         plot_ui.text(egui_plot::Text::new(
                             format!("label-F{}", fi + 1),
@@ -260,18 +279,95 @@ impl FormantPlot {
                                 .size(15.0),
                         ));
                     }
-                }
 
-                // make sure to draw the target overlay after the plot!
-                if let Some(phoneme) = active_phoneme {
-                    phoneme::draw_target_overlay(
-                        plot_ui,
-                        phoneme::target_for(phoneme),
-                        &FORMANT_COLORS,
-                        (0., self.history.len() as f64),
-                    );
-                }
-            })
+                    if let Some(target_formant) = active_phoneme.map(phoneme::target_for) {
+                        phoneme::draw_band_for_slot(
+                            plot_ui,
+                            target_formant,
+                            fi,
+                            (0., self.history.len() as f64),
+                        );
+                    }
+                })
+        })
+    }
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        active_phoneme: Option<phoneme::Phoneme>,
+        view_mode: phoneme::ViewMode,
+    ) {
+        match view_mode {
+            // TODO: maybe add a split-view? like instead of having all formants on one,
+            // have one quadrant per formant? could be a lot easier to use
+            phoneme::ViewMode::Grouped => {
+                Plot::new("formants")
+                    .include_y(0.0)
+                    .include_y(6000.0)
+                    .default_y_bounds(0.0, 6000.0)
+                    .show(ui, |plot_ui| {
+                        // here we iterate over each formant per index... strange...
+                        #[expect(clippy::needless_range_loop)]
+                        for fi in 0..4 {
+                            render_formant_by_index(
+                                plot_ui,
+                                &self.history,
+                                fi,
+                                3.0,
+                                FORMANT_COLORS[fi],
+                            );
+
+                            let cursor_label_x =
+                                usize::min(self.history.len(), self.history_threshold) as f64 + 10.;
+
+                            // bold label floating on the line itself
+                            if self.last_valid[fi] > 0.0 {
+                                plot_ui.text(egui_plot::Text::new(
+                                    format!("label-F{}", fi + 1),
+                                    egui_plot::PlotPoint::new(
+                                        cursor_label_x,
+                                        self.last_valid[fi] as f64,
+                                    ),
+                                    egui::RichText::new(format!("F{}", fi + 1))
+                                        .color(FORMANT_COLORS[fi])
+                                        .strong()
+                                        .size(15.0),
+                                ));
+                            }
+                        }
+
+                        // make sure to draw the target overlay after the plot!
+                        if let Some(target_formant) = active_phoneme.map(phoneme::target_for) {
+                            phoneme::draw_target_overlay(
+                                plot_ui,
+                                target_formant,
+                                &FORMANT_COLORS,
+                                (0., self.history.len() as f64),
+                            );
+                        }
+                    });
+            }
+            phoneme::ViewMode::Split => {
+                let egui::Vec2 { x: w, y: h } = ui.available_size() / 2.;
+
+                // some small sizing margin to account for
+                // axes and individual plot labels taking
+                // up some of the space
+                let size_margin = 30.;
+                let size = (w - size_margin, h);
+
+                ui.vertical(|ui| {
+                    ui.horizontal_top(|ui| {
+                        self.draw_formant_plot(ui, active_phoneme, 0, size);
+                        self.draw_formant_plot(ui, active_phoneme, 1, size);
+                    });
+                    ui.horizontal_top(|ui| {
+                        self.draw_formant_plot(ui, active_phoneme, 2, size);
+                        self.draw_formant_plot(ui, active_phoneme, 3, size);
+                    });
+                });
+            }
+        }
     }
 }
 

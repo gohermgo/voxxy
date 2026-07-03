@@ -2,6 +2,8 @@
 //! Lives entirely at the app layer — lpc_extract_formants and assign_formants
 //! stay untouched. This module only reads formant history/state, never writes it.
 
+use std::collections::VecDeque;
+
 use egui::Color32;
 use egui_plot::{HLine, Line, PlotPoints, PlotUi, Polygon};
 
@@ -49,6 +51,18 @@ pub struct FormantTarget {
     pub f2: (f32, f32),
     pub f3: (f32, f32),
     pub f4: (f32, f32),
+}
+
+impl FormantTarget {
+    fn slot(&self, idx: usize) -> (f32, f32) {
+        match idx {
+            0 => self.f1,
+            1 => self.f2,
+            2 => self.f3,
+            3 => self.f4,
+            _ => unreachable!("formant index out of range, only 0..4 exist"),
+        }
+    }
 }
 
 pub const PHONEME_TARGETS: &[(Phoneme, FormantTarget)] = &[
@@ -116,6 +130,8 @@ pub fn target_for(phoneme: Phoneme) -> FormantTarget {
         .map(|(_, t)| *t)
         .expect("Phoneme::ALL and PHONEME_TARGETS must stay in sync")
 }
+
+pub const FORMANT_LABELS: [&str; 4] = ["F1", "F2", "F3", "F4"];
 
 // ---------------------------------------------------------------------------
 // fork two: horizontal band rendering (x-axis is time/frame index, so the
@@ -202,6 +218,22 @@ fn dashed_hline(
         .width(1.5)
 }
 
+/// slot-indexed wrapper, single call site for grouped + split modes
+pub fn draw_band_for_slot(
+    plot_ui: &mut PlotUi,
+    target: FormantTarget,
+    idx: usize,
+    x_range: (f64, f64),
+) {
+    draw_formant_band(
+        FORMANT_LABELS[idx],
+        plot_ui,
+        target.slot(idx),
+        crate::FORMANT_COLORS[idx],
+        x_range,
+    );
+}
+
 /// Convenience: draw all four formant bands for a target in one go.
 /// Colors are just suggestions — wire up to your existing F1..F4 palette.
 pub fn draw_target_overlay(
@@ -272,4 +304,111 @@ pub fn phoneme_combobox(ui: &mut egui::Ui, selection: &mut PhonemeSelection) {
 //     if let Some(phoneme) = self.phoneme_selection.active {
 //         draw_target_overlay(plot_ui, target_for(phoneme));
 //     }
+// });
+
+// ---------------------------------------------------------------------------
+// view mode: grouped (one shared plot, current behavior) vs split (one
+// dedicated plot per formant, avoids the F1-gets-smushed problem entirely
+// without needing a log-scale axis / custom Painter)
+// ---------------------------------------------------------------------------
+
+#[derive(Default, PartialEq, Clone, Copy)]
+pub enum ViewMode {
+    #[default]
+    Grouped,
+    Split,
+}
+
+pub fn view_mode_toggle(ui: &mut egui::Ui, mode: &mut ViewMode) {
+    ui.selectable_value(mode, ViewMode::Grouped, "Grouped");
+    ui.selectable_value(mode, ViewMode::Split, "Split");
+}
+
+/// Top-level render entry point — call this from FormantApp::update in
+/// place of wherever the single Plot::new(...) call currently lives.
+///
+/// TODO: have to make this function be used, or at least the two functions inside...
+#[expect(dead_code)]
+pub fn render_formant_view(
+    ui: &mut egui::Ui,
+    history: &VecDeque<[f32; 4]>,
+    selection: &PhonemeSelection,
+    mode: ViewMode,
+) {
+    let x_range = (0.0, history.len().max(1) as f64);
+    let target = selection.active.map(target_for);
+
+    match mode {
+        ViewMode::Grouped => {
+            egui_plot::Plot::new("formant_plot_grouped").show(ui, |plot_ui| {
+                draw_scatter_all(plot_ui, history);
+                if let Some(t) = target {
+                    for i in 0..4 {
+                        draw_band_for_slot(plot_ui, t, i, x_range);
+                    }
+                }
+            });
+        }
+        ViewMode::Split =>
+        {
+            #[expect(clippy::needless_range_loop)]
+            for i in 0..4 {
+                ui.label(FORMANT_LABELS[i]);
+                egui_plot::Plot::new(format!("formant_plot_split_{i}"))
+                    .height(140.0)
+                    .show(ui, |plot_ui| {
+                        draw_scatter_slot(plot_ui, history, i);
+                        if let Some(t) = target {
+                            draw_band_for_slot(plot_ui, t, i, x_range);
+                        }
+                    });
+            }
+        }
+    }
+}
+
+/// existing grouped scatter behavior — replace with whatever ur current
+/// FormantPlot scatter code actually does, this is just a stand-in so the
+/// file compiles standalone
+fn draw_scatter_all(plot_ui: &mut PlotUi, history: &VecDeque<[f32; 4]>) {
+    for i in 0..4 {
+        draw_scatter_slot(plot_ui, history, i);
+    }
+}
+
+fn draw_scatter_slot(plot_ui: &mut PlotUi, history: &VecDeque<[f32; 4]>, idx: usize) {
+    let points: PlotPoints = history
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f[idx] > 0.0) // skip unvoiced-frame zero fill
+        .map(|(x, f)| [x as f64, f[idx] as f64])
+        .collect::<Vec<_>>()
+        .into();
+    plot_ui.points(
+        egui_plot::Points::new(format!("{}_series", FORMANT_LABELS[idx]), points)
+            .color(crate::FORMANT_COLORS[idx])
+            .radius(2.0)
+            .name(FORMANT_LABELS[idx]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// wiring sketch — FormantApp fields + call site
+// ---------------------------------------------------------------------------
+//
+// pub struct FormantApp {
+//     history: VecDeque<[f32; 4]>,
+//     phoneme_selection: PhonemeSelection,
+//     view_mode: ViewMode,
+//     // ... existing fields ...
+// }
+//
+// // inside update():
+// egui::CentralPanel::default().show(ctx, |ui| {
+//     ui.horizontal(|ui| {
+//         phoneme_combobox(ui, &mut self.phoneme_selection);
+//         view_mode_toggle(ui, &mut self.view_mode);
+//     });
+//
+//     render_formant_view(ui, &self.history, &self.phoneme_selection, self.view_mode);
 // });
